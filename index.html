@@ -521,14 +521,8 @@ let apiKey = '';
 let selectedTopic = '';
 let conversationHistory = [];
 let currentSession = null;
-let mediaRecorder = null;
-let audioChunks = [];
 let isRecording = false;
 let isSpeaking = false;
-let audioContext = null;
-let analyserNode = null;
-let levelTimer = null;
-let micStream = null;
 
 // ══════════════════════════════════
 // DOM
@@ -646,117 +640,78 @@ REGELN:
 }
 
 // ══════════════════════════════════
-// TRANSCRIBE via Gemini
+// WEB SPEECH API — розпізнавання
 // ══════════════════════════════════
-async function transcribeAudio(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = async () => {
-      const b64 = reader.result.split(',')[1];
-      const mime = blob.type || 'audio/webm';
-      const body = {
-        contents: [{ role:'user', parts:[
-          { inline_data: { mime_type: mime, data: b64 } },
-          { text: 'Transcribe this German speech to text. Return ONLY the transcribed German text, nothing else. If unclear, return empty string.' }
-        ]}],
-        generationConfig: { temperature: 0, maxOutputTokens: 200 }
-      };
-      try {
-        const r = await fetch(`${GEMINI_URL}?key=${apiKey}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-        const d = await r.json();
-        if (d.error) { reject(d.error.message); return; }
-        resolve(d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '');
-      } catch(e) { reject(e.message); }
-    };
-    reader.readAsDataURL(blob);
-  });
-}
+let recognition = null;
 
-// ══════════════════════════════════
-// MIC RECORDING
-// ══════════════════════════════════
-micBtn.addEventListener('click', toggleRecording);
-
-async function toggleRecording() {
-  if (isSpeaking) { window.speechSynthesis.cancel(); isSpeaking = false; }
-  if (isRecording) { stopRecording(); }
-  else { await startRecording(); }
-}
-
-async function startRecording() {
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-  } catch(e) {
-    // Show detailed help based on error
-    if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
-      showToast('❌ Дозвіл відхилено.\nВідкрий Chrome → ⋮ меню → Налаштування сайту → Мікрофон → Дозволити\nАбо постав файл на Netlify.');
-    } else if (e.name === 'NotFoundError') {
-      showToast('❌ Мікрофон не знайдено');
-    } else {
-      showToast('❌ Мікрофон: ' + e.message + '\nСпробуй відкрити через Netlify.');
-    }
-    return;
-  }
-
-  audioChunks = [];
-
-  // Level meter
-  try {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    const src = audioContext.createMediaStreamSource(micStream);
-    analyserNode = audioContext.createAnalyser();
-    analyserNode.fftSize = 256;
-    src.connect(analyserNode);
-    levelBar.classList.add('active');
-    drawLevel();
-  } catch(e) {}
-
-  const mime = ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4']
-    .find(m => MediaRecorder.isTypeSupported(m)) || '';
-  mediaRecorder = new MediaRecorder(micStream, mime ? { mimeType: mime } : {});
-  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
-
-  mediaRecorder.onstop = async () => {
-    stopLevelMeter();
-    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-    const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-    if (blob.size < 1200) {
-      showToast('Запис занадто короткий, говори трохи довше');
-      resetMicUI();
-      return;
-    }
+function initSpeechRecognition() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    showToast('Браузер не підтримує розпізнавання мови. Використай Chrome.');
     micBtn.disabled = true;
-    micHint.textContent = '⏳ Розпізнаю мову…';
-    setStatus('thinking');
-    showTyping();
-    try {
-      const transcript = await transcribeAudio(blob);
-      if (!transcript) {
-        removeTyping();
-        showToast('Не вдалося розпізнати. Говори чіткіше і ближче до мікрофона.');
-        resetMicUI();
-        return;
-      }
-      addMessage('user', transcript);
-      await callGeminiText(transcript);
-    } catch(e) {
-      removeTyping();
-      showToast('Помилка розпізнавання: ' + e);
-      resetMicUI();
-    }
-    micBtn.disabled = false;
-    micHint.textContent = 'Натисни і говори по-німецьки';
+    return false;
+  }
+  recognition = new SR();
+  recognition.lang = 'de-DE';
+  recognition.continuous = false;
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+
+  recognition.onstart = () => {
+    isRecording = true;
+    micBtn.classList.add('recording');
+    micHint.textContent = '🔴 Слухаю… говори по-німецьки';
+    setStatus('recording');
   };
 
-  mediaRecorder.start();
-  isRecording = true;
-  micBtn.classList.add('recording');
-  micHint.textContent = '🔴 Запис… натисни знову щоб надіслати';
-  setStatus('recording');
+  recognition.onresult = (e) => {
+    const transcript = e.results[0][0].transcript.trim();
+    if (transcript) {
+      addMessage('user', transcript);
+      showTyping();
+      callGeminiText(transcript);
+    }
+  };
+
+  recognition.onerror = (e) => {
+    if (e.error === 'not-allowed') {
+      showToast('❌ Дозвіл на мікрофон відхилено.\nНатисни 🔒 в адресному рядку → Мікрофон → Дозволити');
+    } else if (e.error === 'no-speech') {
+      showToast('Не чую мови. Спробуй ще раз.');
+    } else if (e.error !== 'aborted') {
+      showToast('Помилка мікрофону: ' + e.error);
+    }
+    resetMicUI();
+  };
+
+  recognition.onend = () => {
+    if (isRecording) resetMicUI();
+  };
+
+  return true;
+}
+
+micBtn.addEventListener('click', toggleRecording);
+
+function toggleRecording() {
+  if (isSpeaking) { window.speechSynthesis.cancel(); isSpeaking = false; }
+  if (isRecording) {
+    if (recognition) recognition.stop();
+    resetMicUI();
+    return;
+  }
+  if (!recognition && !initSpeechRecognition()) return;
+  try {
+    recognition.start();
+  } catch(e) {
+    // reinit if already started
+    initSpeechRecognition();
+    setTimeout(() => { try { recognition.start(); } catch(e2) {} }, 300);
+  }
 }
 
 function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  if (recognition) try { recognition.stop(); } catch(e) {}
   isRecording = false;
   micBtn.classList.remove('recording');
 }
@@ -765,24 +720,6 @@ function resetMicUI() {
   setStatus('ready');
   micBtn.disabled = false;
   micHint.textContent = 'Натисни і говори по-німецьки';
-}
-
-function drawLevel() {
-  if (!analyserNode) return;
-  const buf = new Uint8Array(analyserNode.frequencyBinCount);
-  function loop() {
-    levelTimer = requestAnimationFrame(loop);
-    analyserNode.getByteFrequencyData(buf);
-    const avg = buf.reduce((a,b)=>a+b,0)/buf.length;
-    levelFill.style.width = Math.min(100, avg*2.5)+'%';
-  }
-  loop();
-}
-function stopLevelMeter() {
-  if (levelTimer) { cancelAnimationFrame(levelTimer); levelTimer=null; }
-  levelBar.classList.remove('active');
-  levelFill.style.width='0%';
-  if (audioContext) { audioContext.close().catch(()=>{}); audioContext=null; analyserNode=null; }
 }
 
 // ══════════════════════════════════
